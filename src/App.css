@@ -1,0 +1,13 @@
+@import "tailwindcss";
+
+#boxitem , #root
+{
+  width: 100%;
+  min-height: 500px;;
+}
+canvas 
+{
+  width: 100vw;
+   height: 100vh;
+   min-height: 600px;
+}
