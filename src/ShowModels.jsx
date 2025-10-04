@@ -35,6 +35,71 @@ function calculateAngle(A, B, C) {
 function InteractionController({ objects, points, setPoints, mode, setTempPoint }) {
   const { camera, gl } = useThree();
   const raycaster = useRef(new THREE.Raycaster()).current;
+  const [lockedPlane, setLockedPlane] = useState(null);
+
+  const SNAP_THRESHOLD = 0.1;
+
+  const snapToVerticesAndEdges = (face, object, point) => {
+    const geom = face && object.geometry;
+    if (!geom || !geom.attributes.position) return point;
+    const positions = geom.attributes.position.array;
+    let closest = point.clone();
+    let minDist = Infinity;
+
+    // ---------- چسبندگی به رئوس ----------
+    for (let i = 0; i < positions.length; i += 3) {
+      const vertex = new THREE.Vector3(positions[i], positions[i + 1], positions[i + 2]);
+      vertex.applyMatrix4(object.matrixWorld);
+      const dist = vertex.distanceTo(point);
+      if (dist < SNAP_THRESHOLD && dist < minDist) {
+        closest = vertex.clone();
+        minDist = dist;
+      }
+    }
+
+    // ---------- چسبندگی به لبه‌ها ----------
+    for (let i = 0; i < positions.length; i += 9) { // هر فیس 3 راس
+      const v0 = new THREE.Vector3(positions[i], positions[i + 1], positions[i + 2]).applyMatrix4(object.matrixWorld);
+      const v1 = new THREE.Vector3(positions[i + 3], positions[i + 4], positions[i + 5]).applyMatrix4(object.matrixWorld);
+      const v2 = new THREE.Vector3(positions[i + 6], positions[i + 7], positions[i + 8]).applyMatrix4(object.matrixWorld);
+
+      [[v0, v1], [v1, v2], [v2, v0]].forEach(([a, b]) => {
+        const ab = new THREE.Vector3().subVectors(b, a);
+        const t = ab.dot(new THREE.Vector3().subVectors(point, a)) / ab.lengthSq();
+        if (t >= 0 && t <= 1) {
+          const proj = new THREE.Vector3().copy(a).add(ab.multiplyScalar(t));
+          const dist = proj.distanceTo(point);
+          if (dist < SNAP_THRESHOLD && dist < minDist) {
+            closest = proj.clone();
+            minDist = dist;
+          }
+        }
+      });
+    }
+
+    return closest;
+  };
+
+
+  const snapToVertices = (face, object, point) => {
+    const geom = face && object.geometry;
+    if (!geom || !geom.attributes.position) return point;
+    const positions = geom.attributes.position.array;
+    let closest = point.clone();
+    let minDist = Infinity;
+
+    for (let i = 0; i < positions.length; i += 3) {
+      const vertex = new THREE.Vector3(positions[i], positions[i + 1], positions[i + 2]);
+      vertex.applyMatrix4(object.matrixWorld);
+      const dist = vertex.distanceTo(point);
+      if (dist < SNAP_THRESHOLD && dist < minDist) {
+        closest = vertex.clone();
+        minDist = dist;
+      }
+    }
+
+    return closest;
+  };
 
   const handleMove = useCallback(
     (event) => {
@@ -51,24 +116,31 @@ function InteractionController({ objects, points, setPoints, mode, setTempPoint 
         setTempPoint(null);
         return;
       }
-      const point = intersects[0].point.clone();
 
-      if (
-        (mode === "point" && points.length >= 1) ||
-        (mode === "angle" && points.length < 3) ||
-        (mode === "face" && points.length >= 1)
-      ) {
-        setTempPoint(point);
-      } else {
-        setTempPoint(null);
+      const hit = intersects[0];
+      let point = hit.point.clone();
+
+      if (mode === "face" && lockedPlane) {
+        const { normal, planePoint } = lockedPlane;
+        const dist = normal.dot(point.clone().sub(planePoint));
+        if (Math.abs(dist) > 1e-3) {
+          setTempPoint(null);
+          return;
+        }
       }
+
+      // if (mode === "face") point = snapToVertices(hit.face, hit.object, point);
+      if (mode === "face") point = snapToVerticesAndEdges(hit.face, hit.object, point);
+
+      setTempPoint(point);
     },
-    [camera, gl, objects, mode, points, setTempPoint, raycaster]
+    [camera, gl, objects, mode, raycaster, lockedPlane, setTempPoint]
   );
 
   const handleClick = useCallback(
     (event) => {
       if (!objects || objects.length === 0) return;
+
       const rect = gl.domElement.getBoundingClientRect();
       const x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
       const y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
@@ -76,25 +148,34 @@ function InteractionController({ objects, points, setPoints, mode, setTempPoint 
       const intersects = raycaster.intersectObjects(objects, true);
       if (!intersects.length) return;
 
-      if (mode === "angle" && points.length >= 3) return;
+      const hit = intersects[0];
+      let point = hit.point.clone();
 
-      const point = intersects[0].point.clone();
-
-      if (mode === "point") {
-        if (points.length < 2) {
-          setPoints((prev) => [...prev, point]);
-        } else {
-          setPoints([points[points.length - 1], point]);
+      if (mode === "face") {
+        if (!lockedPlane && points.length === 0) {
+          const worldNormal = hit.face.normal
+            .clone()
+            .applyMatrix3(new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld))
+            .normalize();
+          setLockedPlane({ normal: worldNormal, planePoint: point.clone() });
+        } else if (lockedPlane) {
+          const { normal, planePoint } = lockedPlane;
+          const dist = normal.dot(point.clone().sub(planePoint));
+          if (Math.abs(dist) > 1e-3) return;
         }
-        setTempPoint(null);
-        return;
+
+        point = snapToVertices(hit.face, hit.object, point);
       }
 
       setPoints((prev) => [...prev, point]);
       setTempPoint(null);
     },
-    [camera, raycaster, objects, mode, points, setPoints, setTempPoint]
+    [camera, gl, objects, mode, points, raycaster, lockedPlane, setPoints]
   );
+
+  useEffect(() => {
+    if (mode !== "face" || points.length === 0) setLockedPlane(null);
+  }, [mode, points.length]);
 
   useEffect(() => {
     const canvas = gl.domElement;
@@ -112,9 +193,8 @@ function InteractionController({ objects, points, setPoints, mode, setTempPoint 
 // ------------------------
 // OverlayProjector
 // ------------------------
-function OverlayProjector({ overlayRef, points, tempPoint, mode, distanceInFeet, tempDistance }) {
+function OverlayProjector({ overlayRef, points, tempPoint, mode }) {
   const { camera, size } = useThree();
-
   const projectTo2D = (vec3) => {
     const vp = vec3.clone().project(camera);
     return {
@@ -127,7 +207,6 @@ function OverlayProjector({ overlayRef, points, tempPoint, mode, distanceInFeet,
   useFrame(() => {
     const canvas = overlayRef.current;
     if (!canvas) return;
-
     const dpr = Math.max(1, window.devicePixelRatio || 1);
     const w = Math.floor(size.width * dpr);
     const h = Math.floor(size.height * dpr);
@@ -137,85 +216,84 @@ function OverlayProjector({ overlayRef, points, tempPoint, mode, distanceInFeet,
       canvas.style.width = `${size.width}px`;
       canvas.style.height = `${size.height}px`;
     }
-
     const ctx = canvas.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, size.width, size.height);
 
-    function drawLine(p0, p1, color = "white", width = 2) {
+    const drawLine = (p0, p1, color = "white", width = 2) => {
       ctx.strokeStyle = color;
       ctx.lineWidth = width;
       ctx.beginPath();
       ctx.moveTo(p0.x, p0.y);
       ctx.lineTo(p1.x, p1.y);
       ctx.stroke();
+    };
+
+    const drawText = (x, y, text) => {
+      ctx.font = "16px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      const padding = 10;
+      const tw = ctx.measureText(text).width + padding * 2;
+      const th = 28;
+      ctx.fillStyle = "rgba(0,0,0,0.85)";
+      ctx.fillRect(x - tw / 2, y - th, tw, th);
+      ctx.fillStyle = "white";
+      ctx.fillText(text, x, y - 5);
+    };
+
+    function drawArc(center, p1, p2, color = "orange") {
+      const c = projectTo2D(center);
+      const p1_2d = projectTo2D(p1);
+      const p2_2d = projectTo2D(p2);
+
+      const v1 = { x: p1_2d.x - c.x, y: p1_2d.y - c.y };
+      const v2 = { x: p2_2d.x - c.x, y: p2_2d.y - c.y };
+
+      const startAngle = Math.atan2(v1.y, v1.x);
+      const endAngle = Math.atan2(v2.y, v2.x);
+
+      const cross = v1.x * v2.y - v1.y * v2.x;
+      const anticlockwise = cross < 0;
+
+      const radius = 40;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, radius, startAngle, endAngle, anticlockwise);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
     }
 
-  function drawText(x, y, text, boxOffsetY = -50, textOffsetY = -50) {
-    ctx.font = "16px sans-serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "bottom";
-
-    const padding = 10;
-    const tw = ctx.measureText(text).width + padding * 2;
-    const th = 28;
-
-    // جعبه پس‌زمینه با جابجایی دلخواه
-    ctx.fillStyle = "rgba(0,0,0,0.85)";
-    ctx.fillRect(x - tw / 2, y - th + 6 + boxOffsetY, tw, th);
-
-    // متن با جابجایی دلخواه
-    ctx.fillStyle = "white";
-    ctx.fillText(text, x, y + 1 + textOffsetY);
-}
-
-function drawArc(center, p1, p2, color = "orange") {
-  const c = projectTo2D(center);
-  const p1_2d = projectTo2D(p1);
-  const p2_2d = projectTo2D(p2);
-
-  // بردارهای 2D نسبت به مرکز
-  const v1 = { x: p1_2d.x - c.x, y: p1_2d.y - c.y };
-  const v2 = { x: p2_2d.x - c.x, y: p2_2d.y - c.y };
-
-  // زاویه شروع و پایان
-  const startAngle = Math.atan2(v1.y, v1.x);
-  const endAngle = Math.atan2(v2.y, v2.x);
-
-  let sweep = endAngle - startAngle;
-  if (sweep < 0) sweep += Math.PI * 2;
-
-  const radius = 40;
-
-  ctx.beginPath();
-  ctx.arc(c.x, c.y, radius, startAngle, startAngle + sweep, false);
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 2;
-  ctx.stroke();
-}
-
-
-    // -------------------------
+    // ------------------------
     // طول
-    // -------------------------
+    // ------------------------
     if (mode === "point") {
-      if (points.length >= 1 && tempPoint) {
-        const p0 = projectTo2D(points[points.length - 1]);
-        const p1 = projectTo2D(tempPoint);
-        drawLine(p0, p1, "orange", 2);
-        if (tempDistance) drawText((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, `${tempDistance} ft`);
+      if (points.length % 2 === 1 && tempPoint) {
+        drawLine(projectTo2D(points[points.length - 1]), projectTo2D(tempPoint), "orange", 2);
+        const tempDistFeet = ((points[points.length - 1].distanceTo(tempPoint) * 39.3701) / 12).toFixed(2);
+        drawText(
+          (projectTo2D(points[points.length - 1]).x + projectTo2D(tempPoint).x) / 2,
+          (projectTo2D(points[points.length - 1]).y + projectTo2D(tempPoint).y) / 2,
+          `${tempDistFeet} ft`
+        );
       }
-      if (points.length >= 2) {
-        const p0 = projectTo2D(points[0]);
-        const p1 = projectTo2D(points[1]);
-        drawLine(p0, p1, "yellow", 4);
-        if (distanceInFeet) drawText((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, `${distanceInFeet} ft`);
+
+      for (let i = 0; i < points.length; i += 2) {
+        if (points[i + 1]) {
+          drawLine(projectTo2D(points[i]), projectTo2D(points[i + 1]), "yellow", 4);
+          const distFeet = ((points[i].distanceTo(points[i + 1]) * 39.3701) / 12).toFixed(2);
+          drawText(
+            (projectTo2D(points[i]).x + projectTo2D(points[i + 1]).x) / 2,
+            (projectTo2D(points[i]).y + projectTo2D(points[i + 1]).y) / 2,
+            `${distFeet} ft`
+          );
+        }
       }
     }
 
-    // -------------------------
+    // ------------------------
     // زاویه
-    // -------------------------
+    // ------------------------
     if (mode === "angle") {
       if (points.length === 1 && tempPoint) {
         drawLine(projectTo2D(points[0]), projectTo2D(tempPoint), "orange", 2);
@@ -237,21 +315,20 @@ function drawArc(center, p1, p2, color = "orange") {
       }
     }
 
-    // -------------------------
+    // ------------------------
     // مساحت
-    // -------------------------
+    // ------------------------
     if (mode === "face") {
       const polyPoints = tempPoint ? [...points, tempPoint] : points;
       if (polyPoints.length >= 2) {
         ctx.beginPath();
-        const start = projectTo2D(polyPoints[0]);
-        ctx.moveTo(start.x, start.y);
+        ctx.moveTo(projectTo2D(polyPoints[0]).x, projectTo2D(polyPoints[0]).y);
         for (let i = 1; i < polyPoints.length; i++) {
           const p = projectTo2D(polyPoints[i]);
           ctx.lineTo(p.x, p.y);
         }
-        if (tempPoint || polyPoints.length >= 3) ctx.closePath();
-        ctx.fillStyle = "rgba(0, 200, 255, 0.3)";
+        if (polyPoints.length >= 3 || tempPoint) ctx.closePath();
+        ctx.fillStyle = "rgba(0,200,255,0.3)";
         ctx.fill();
         ctx.strokeStyle = "orange";
         ctx.lineWidth = 2;
@@ -288,20 +365,6 @@ function ShowModels() {
   draco.setDecoderPath("./draco/");
   const model = useLoader(GLTFLoader, `./models/t.glb`, (loader) => loader.setDRACOLoader(draco));
 
-  const distanceMeters = points.length === 2 ? points[0].distanceTo(points[1]) : null;
-  const distanceInFeet = distanceMeters ? ((distanceMeters * 39.3701) / 12).toFixed(2) : null;
-  const tempDistance =
-    mode === "point" && points.length >= 1 && tempPoint
-      ? ((points[points.length - 1].distanceTo(tempPoint) * 39.3701) / 12).toFixed(2)
-      : null;
-
-  const polygonAreaMeters = mode === "face" && points.length >= 3 ? polygonArea3D(points) : null;
-  const polygonAreaInFeet = polygonAreaMeters ? ((polygonAreaMeters * 1550.0031) / 144).toFixed(2) : null;
-  const tempPolygonAreaInFeet =
-    mode === "face" && points.length >= 1 && tempPoint
-      ? ((polygonArea3D([...points, tempPoint]) * 1550.0031) / 144).toFixed(2)
-      : null;
-
   const objects = [];
   if (modelGroup.current) objects.push(modelGroup.current);
   if (cubeRef.current) objects.push(cubeRef.current);
@@ -324,19 +387,22 @@ function ShowModels() {
 
         {points.map((point, index) => (
           <Html key={index} position={point} center style={{ transform: "translate(-50%,-50%)", pointerEvents: "none" }}>
-            <div style={{
-              width: "30px",
-              height: "30px",
-              background: "rgba(0,200,255,0.8)",
-              borderRadius: "50%",
-              border: "2px solid white",
-              boxShadow: "0 0 10px rgba(0,200,255,0.7)"
-            }} />
+            <div
+              style={{
+                width: "30px",
+                height: "30px",
+                background: "rgba(0,200,255,0.8)",
+                borderRadius: "50%",
+                border: "2px solid white",
+                boxShadow: "0 0 10px rgba(0,200,255,0.7)",
+              }}
+            />
           </Html>
         ))}
 
         <InteractionController objects={objects} points={points} setPoints={setPoints} mode={mode} setTempPoint={setTempPoint} />
-        <OverlayProjector overlayRef={overlayRef} points={points} tempPoint={tempPoint} mode={mode} distanceInFeet={distanceInFeet} tempDistance={tempDistance} polygonAreaInFeet={polygonAreaInFeet} tempPolygonAreaInFeet={tempPolygonAreaInFeet} />
+        <OverlayProjector overlayRef={overlayRef} points={points} tempPoint={tempPoint} mode={mode} />
+
       </Canvas>
 
       <canvas ref={overlayRef} style={{ position: "absolute", left: 0, top: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 50 }} />
